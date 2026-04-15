@@ -77,9 +77,31 @@ class Model:
             ) from exc
 
         hyperparams = dict(spec.get("hyperparams", {}))
+        order = tuple(int(v) for v in hyperparams.get("order", (1, 1, 1)))
+        seasonal_order = tuple(
+            int(v) for v in hyperparams.get("seasonal_order", (0, 0, 0, 0))
+        )
+        trend = hyperparams.get("trend")
+        fit_kwargs = {
+            key: hyperparams[key]
+            for key in (
+                "start_params",
+                "transformed",
+                "includes_fixed",
+                "method",
+                "method_kwargs",
+                "gls",
+                "gls_kwargs",
+                "cov_type",
+                "cov_kwds",
+                "return_params",
+                "low_memory",
+            )
+            if key in hyperparams
+        }
         seq_len = int(spec["seq_len"])
         pred_len = int(spec["pred_len"])
-        stride = int(hyperparams.get("window_stride", pred_len))
+        stride = int(hyperparams.get("window_stride", 1))
 
         series = eval_payload["data"][:, target_index].astype(np.float64)
         timestamps = eval_payload["timestamps"]
@@ -102,10 +124,10 @@ class Model:
 
             fitted = ARIMA(
                 context,
-                order=self._order,
-                seasonal_order=self._seasonal_order,
-                trend=self._trend,
-            ).fit(**self._fit_kwargs)
+                order=order,
+                seasonal_order=seasonal_order,
+                trend=trend,
+            ).fit(**fit_kwargs)
             predictions = np.asarray(fitted.forecast(steps=pred_len), dtype=np.float64)
 
             for timestamp, actual_value, predicted_value in zip(

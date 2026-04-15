@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import importlib
 import json
 import sys
@@ -25,6 +26,21 @@ from CastZoo.evaluator import evaluate
 from CastZoo.utils.device import detect_device, get_device_info
 from CastZoo.utils.hash import compute_spec_hash
 from CastZoo.utils.seed import set_seed
+
+RESULTS_ROOT = Path("/data/ygliu/myprojects/CastFamily/results")
+SUMMARY_COLUMNS = [
+    "status",
+    "dataset",
+    "model",
+    "phase",
+    "eval_split",
+    "seq_len",
+    "pred_len",
+    "mae",
+    "mse",
+    "mase",
+    "wape",
+]
 
 
 class LazyModelDict(dict):
@@ -139,6 +155,120 @@ def get_target_index(spec: dict[str, Any]) -> int:
     if spec["target_col"] not in feature_cols:
         raise ValueError(f"Target column {spec['target_col']!r} not found in dataset")
     return feature_cols.index(spec["target_col"])
+
+
+def to_jsonable(value: Any) -> Any:
+    """Convert numpy/path-like values into JSON-serialisable objects."""
+    if isinstance(value, dict):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def get_dataset_name(spec: dict[str, Any]) -> str:
+    """Infer a compact dataset name from the configured dataset path."""
+    dataset_path = spec.get("dataset_path")
+    if not dataset_path:
+        return "unknown_dataset"
+    return Path(dataset_path).stem
+
+
+def build_result_record(
+    *,
+    spec: dict[str, Any],
+    spec_path: Path,
+    run_id: str,
+    run_dir: Path,
+    status: str,
+    model_family: str | None,
+    metrics: dict[str, Any] | None = None,
+    error: str | None = None,
+    error_type: str | None = None,
+) -> dict[str, Any]:
+    """Build a portable result record for results/ exports."""
+    return {
+        "run_id": run_id,
+        "status": status,
+        "dataset": get_dataset_name(spec),
+        "dataset_path": spec.get("dataset_path"),
+        "model": spec.get("model"),
+        "model_family": model_family,
+        "phase": spec.get("phase"),
+        "eval_split": spec.get("eval_split", "val"),
+        "time_col": spec.get("time_col"),
+        "target_col": spec.get("target_col"),
+        "seq_len": spec.get("seq_len"),
+        "pred_len": spec.get("pred_len"),
+        "spec_path": str(spec_path),
+        "out_dir": str(run_dir),
+        "metrics": to_jsonable(metrics),
+        "error": error,
+        "error_type": error_type,
+    }
+
+
+def write_result_exports(record: dict[str, Any]) -> None:
+    """Persist a compact summary table under results/summary.csv."""
+    RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
+
+    summary_path = RESULTS_ROOT / "summary.csv"
+    metrics = record.get("metrics") or {}
+    summary_row = {
+        "status": str(record["status"]),
+        "dataset": str(record["dataset"]),
+        "model": str(record["model"]),
+        "phase": str(record["phase"] or ""),
+        "eval_split": str(record["eval_split"] or ""),
+        "seq_len": str(record["seq_len"] or ""),
+        "pred_len": str(record["pred_len"] or ""),
+        "mae": str(metrics.get("mae", "")),
+        "mse": str(metrics.get("mse", "")),
+        "mase": str(metrics.get("mase", "")),
+        "wape": str(metrics.get("wape", "")),
+    }
+
+    if summary_row["status"] == "error":
+        return
+
+    existing_rows: list[dict[str, str]] = []
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                metrics_payload: dict[str, Any] = {}
+                metrics_json = row.get("metrics_json", "")
+                if metrics_json:
+                    with contextlib.suppress(json.JSONDecodeError):
+                        parsed_metrics = json.loads(metrics_json)
+                        if isinstance(parsed_metrics, dict):
+                            metrics_payload = parsed_metrics
+
+                existing_rows.append(
+                    {
+                        "status": row.get("status", ""),
+                        "dataset": row.get("dataset", ""),
+                        "model": row.get("model", ""),
+                        "phase": row.get("phase", ""),
+                        "eval_split": row.get("eval_split", ""),
+                        "seq_len": row.get("seq_len", ""),
+                        "pred_len": row.get("pred_len", ""),
+                        "mae": row.get("mae", "") or str(metrics_payload.get("mae", "")),
+                        "mse": row.get("mse", "") or str(metrics_payload.get("mse", "")),
+                        "mase": row.get("mase", "") or str(metrics_payload.get("mase", "")),
+                        "wape": row.get("wape", "") or str(metrics_payload.get("wape", "")),
+                    }
+                )
+
+    existing_rows.append(summary_row)
+    with summary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
+        writer.writeheader()
+        writer.writerows(existing_rows)
 
 
 # Foundation models that use zero-shot inference and require task_name='zero_shot_forecast'
@@ -288,7 +418,9 @@ def write_classical_predictions(
     spec: dict[str, Any],
 ) -> Path:
     """Fit a statistical/ML wrapper and write evaluation predictions."""
-    model.fit(train_payload=train_payload, target_index=target_index, spec=spec)
+    rolling_eval_only_models = {"ETS", "Theta", "Prophet", "ARIMA", "SARIMA"}
+    if spec.get("model") not in rolling_eval_only_models:
+        model.fit(train_payload=train_payload, target_index=target_index, spec=spec)
     predict_windows = getattr(model, "predict_windows", None)
     if callable(predict_windows):
         rows, actual, predictions = predict_windows(
@@ -334,6 +466,15 @@ def write_classical_predictions(
     np.save(run_dir / "actual.npy", actual, allow_pickle=False)
     np.save(run_dir / "pred.npy", predictions, allow_pickle=False)
     return predictions_path
+
+
+def normalize_classical_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Force classical models to use stride=1 for windowed evaluation."""
+    normalized = dict(spec)
+    hyperparams = dict(spec.get("hyperparams", {}))
+    hyperparams["window_stride"] = 1
+    normalized["hyperparams"] = hyperparams
+    return normalized
 
 
 def get_model_family(module_path: str) -> str:
@@ -424,7 +565,8 @@ def run_statistical_model(
     emit_event: Callable[..., None],
 ) -> Path:
     """Fit and evaluate a statistical forecasting model."""
-    config = build_model_config(spec, dataset_splits["train"]["data"].shape[1])
+    spec_for_classical = normalize_classical_spec(spec)
+    config = build_model_config(spec_for_classical, dataset_splits["train"]["data"].shape[1])
     model = model_class(config)
     emit_event("predict_start")
     return write_classical_predictions(
@@ -433,7 +575,7 @@ def run_statistical_model(
         eval_payload=dataset_splits[eval_split],
         run_dir=run_dir,
         target_index=target_index,
-        spec=spec,
+        spec=spec_for_classical,
     )
 
 
@@ -447,7 +589,8 @@ def run_machine_learning_model(
     emit_event: Callable[..., None],
 ) -> Path:
     """Fit and evaluate a machine-learning forecasting model."""
-    config = build_model_config(spec, dataset_splits["train"]["data"].shape[1])
+    spec_for_classical = normalize_classical_spec(spec)
+    config = build_model_config(spec_for_classical, dataset_splits["train"]["data"].shape[1])
     model = model_class(config)
     emit_event("predict_start")
     return write_classical_predictions(
@@ -456,7 +599,7 @@ def run_machine_learning_model(
         eval_payload=dataset_splits[eval_split],
         run_dir=run_dir,
         target_index=target_index,
-        spec=spec,
+        spec=spec_for_classical,
     )
 
 
@@ -521,19 +664,31 @@ def run_experiment(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     spec, canonical_spec, run_id = load_spec(spec_path)
     run_dir = Path(args.out_dir) / run_id
     evaluator_hash_store = Path(args.evaluator_hash_store)
+    model_name = "ARIMA" if spec["model"] == "SARIMA" else spec["model"]
+    model_registry = LazyModelDict(str(Path(__file__).resolve().parent / "models"))
+    model_family = get_model_family(model_registry.module_path(model_name))
 
     cached_eval_path = run_dir / "eval.json"
     if cached_eval_path.exists():
         cached_eval = json.loads(cached_eval_path.read_text(encoding="utf-8"))
-        return (
-            {
-                "status": "cached",
-                "run_id": run_id,
-                "out_dir": str(run_dir),
-                "metrics": cached_eval.get("metrics"),
-            },
-            0,
+        result = {
+            "status": "cached",
+            "run_id": run_id,
+            "out_dir": str(run_dir),
+            "metrics": cached_eval.get("metrics"),
+        }
+        write_result_exports(
+            build_result_record(
+                spec=spec,
+                spec_path=spec_path,
+                run_id=run_id,
+                run_dir=run_dir,
+                status=result["status"],
+                model_family=model_family,
+                metrics=result.get("metrics"),
+            )
         )
+        return result, 0
 
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "spec.json").write_text(canonical_spec, encoding="utf-8")
@@ -569,10 +724,7 @@ def run_experiment(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     raise ValueError(f"Requested eval split {eval_split!r} is not available")
 
                 target_index = get_target_index(spec)
-                model_name = "ARIMA" if spec["model"] == "SARIMA" else spec["model"]
-                model_registry = LazyModelDict(str(Path(__file__).resolve().parent / "models"))
                 model_class = model_registry[model_name]
-                model_family = get_model_family(model_registry.module_path(model_name))
 
                 if model_family == "statistical":
                     predictions_path = run_statistical_model(
@@ -641,41 +793,70 @@ def run_experiment(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 )
                 _emit_event("done")
 
-            return (
-                {
-                    "status": "success",
-                    "run_id": run_id,
-                    "out_dir": str(run_dir),
-                    "metrics": eval_result["metrics"],
-                },
-                0,
+            result = {
+                "status": "success",
+                "run_id": run_id,
+                "out_dir": str(run_dir),
+                "metrics": eval_result["metrics"],
+            }
+            write_result_exports(
+                build_result_record(
+                    spec=spec,
+                    spec_path=spec_path,
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    status=result["status"],
+                    model_family=model_family,
+                    metrics=result.get("metrics"),
+                )
             )
+            return result, 0
         except torch.cuda.OutOfMemoryError as exc:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             traceback.print_exc(file=train_log)
-            return (
-                {
-                    "status": "error",
-                    "run_id": run_id,
-                    "out_dir": str(run_dir),
-                    "error": str(exc),
-                    "error_type": exc.__class__.__name__,
-                },
-                1,
+            result = {
+                "status": "error",
+                "run_id": run_id,
+                "out_dir": str(run_dir),
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
+            write_result_exports(
+                build_result_record(
+                    spec=spec,
+                    spec_path=spec_path,
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    status=result["status"],
+                    model_family=model_family,
+                    error=result.get("error"),
+                    error_type=result.get("error_type"),
+                )
             )
+            return result, 1
         except BaseException as exc:  # noqa: BLE001
             traceback.print_exc(file=train_log)
-            return (
-                {
-                    "status": "error",
-                    "run_id": run_id,
-                    "out_dir": str(run_dir),
-                    "error": str(exc),
-                    "error_type": exc.__class__.__name__,
-                },
-                1,
+            result = {
+                "status": "error",
+                "run_id": run_id,
+                "out_dir": str(run_dir),
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
+            write_result_exports(
+                build_result_record(
+                    spec=spec,
+                    spec_path=spec_path,
+                    run_id=run_id,
+                    run_dir=run_dir,
+                    status=result["status"],
+                    model_family=model_family,
+                    error=result.get("error"),
+                    error_type=result.get("error_type"),
+                )
             )
+            return result, 1
 
 
 def main(argv: list[str] | None = None) -> int:
